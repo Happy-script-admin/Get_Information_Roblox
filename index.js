@@ -26,10 +26,11 @@ app.get("/getGamePasses/:userId", async (req, res) => {
         },
       });
 
-      if (!response.ok) {
-        const text = await response.text();
-        return res.status(500).json({ error: "Roblox API error", details: text });
-      }
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Roblox API failed:", response.status, text);
+      return res.status(500).json({ error: "Roblox API error", status: response.status, details: text });
+    }
 
       const data = await response.json();
       allPasses.push(...(data.data || []));
