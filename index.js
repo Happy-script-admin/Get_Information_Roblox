@@ -1,85 +1,54 @@
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
+import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-/**
- * Lấy UserId từ username
- */
-async function getUserId(username) {
-  try {
-    const res = await axios.get(
-      `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=1`
-    );
-    const data = res.data;
-    if (data.data && data.data.length > 0) return data.data[0].id;
-    return null;
-  } catch (err) {
-    console.error("[getUserId] Lỗi:", err.message);
-    return null;
-  }
-}
+// ⚙️ Thay bằng API Key thật của bạn từ Open Cloud
+const API_KEY = "YOUR_ROBLOX_API_KEY_HERE";
 
-/**
- * Lấy tất cả GamePass đang bán của user từ RoProxy
- */
-async function getGamePasses(userId) {
+// ✅ Lấy danh sách GamePass của 1 user (userId)
+app.get("/getGamePasses/:userId", async (req, res) => {
+  const userId = req.params.userId;
+  const limit = 100;
+  let cursor = "";
   let allPasses = [];
-  let cursor = null;
 
   try {
     while (true) {
-      const url =
-        `https://www.roproxy.com/users/inventory/list-json?assetTypeId=34&itemsPerPage=100&userId=${userId}` +
-        (cursor ? `&cursor=${cursor}` : "");
-      const res = await axios.get(url);
-      const data = res.data;
+      const url = `https://apis.roblox.com/game-passes/v1/users/${userId}/game-passes?count=${limit}${
+        cursor ? `&exclusiveStartId=${cursor}` : ""
+      }`;
 
-      if (!data || !data.Data || !data.Data.Items) break;
+      const response = await fetch(url, {
+        headers: {
+          "x-api-key": API_KEY,
+        },
+      });
 
-      for (const item of data.Data.Items) {
-        if (item.Product && item.Product.IsForSale) {
-          allPasses.push({
-            id: item.Item.AssetId,
-            name: item.Item.Name,
-            price: item.Product.PriceInRobux,
-          });
-        }
+      if (!response.ok) {
+        const text = await response.text();
+        return res.status(500).json({ error: "Roblox API error", details: text });
       }
 
-      if (!data.Data.nextPageCursor) break;
-      cursor = data.Data.nextPageCursor;
+      const data = await response.json();
+      allPasses.push(...(data.data || []));
+
+      if (!data.nextPageExclusiveStartId) break;
+      cursor = data.nextPageExclusiveStartId;
     }
+
+    const filtered = allPasses.map((p) => ({
+      id: p.id,
+      name: p.name,
+      price: p.price || 0,
+    }));
+
+    res.json({ success: true, passes: filtered });
   } catch (err) {
-    console.error("[getGamePasses] Lỗi lấy GamePass:", err.message);
-  }
-
-  return allPasses;
-}
-
-/**
- * Endpoint: lấy GamePass theo username
- */
-app.get("/gamepasses/:username", async (req, res) => {
-  const username = req.params.username;
-  try {
-    const userId = await getUserId(username);
-    if (!userId) return res.status(404).json({ error: "Không tìm thấy người dùng" });
-
-    const passes = await getGamePasses(userId);
-    const filtered = passes
-      .filter((p) => p.price && p.price > 0)
-      .sort((a, b) => a.price - b.price);
-
-    res.json(filtered);
-  } catch (err) {
-    console.error("[API Error]:", err.message);
-    res.status(500).json({ error: "Không thể lấy dữ liệu GamePass" });
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server proxy Roblox đang chạy trên port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
