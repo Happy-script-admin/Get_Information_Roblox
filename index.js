@@ -1,54 +1,160 @@
-import express from "express";
-import fetch from "node-fetch";
+// index.js
+const express = require("express");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const Chess = require("chess.js").Chess; // chess.js
+const Stockfish = require("stockfish");   // stockfish npm (wasm/worker)
 
 const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
 const PORT = process.env.PORT || 3000;
 
-// ⚙️ Thay bằng API Key thật của bạn từ Open Cloud
-const API_KEY = "GCkk+OuMmUypfbg0VvIr3YmgxOU2CN/JJWQ88i15NP4C/vh7ZXlKaGJHY2lPaUpTVXpJMU5pSXNJbXRwWkNJNkluTnBaeTB5TURJeExUQTNMVEV6VkRFNE9qVXhPalE1V2lJc0luUjVjQ0k2SWtwWFZDSjkuZXlKaGRXUWlPaUpTYjJKc2IzaEpiblJsY201aGJDSXNJbWx6Y3lJNklrTnNiM1ZrUVhWMGFHVnVkR2xqWVhScGIyNVRaWEoyYVdObElpd2lZbUZ6WlVGd2FVdGxlU0k2SWtkRGEyc3JUM1ZOYlZWNWNHWmlaekJXZGtseU0xbHRaM2hQVlRKRFRpOUtTbGRST0RocE1UVk9VRFJETDNab055SXNJbTkzYm1WeVNXUWlPaUkzTXpJMk16azFOVE16SWl3aVpYaHdJam94TnpVNU9EUXdNekkyTENKcFlYUWlPakUzTlRrNE16WTNNallzSW01aVppSTZNVGMxT1Rnek5qY3lObjAuWHBrZFgxNExKY2xYN29wTU9yMENKLVVfNHdJTjM5eUROWUN3TmtQYXNsU2VaUmQzSjd2aVlKeTNPNmRxaWNKYlVwbTYtU1BjV2I5ZWJDZzljWXV1VmxIMVFRcGd5bGFPRjNKeVA0a0l4SjYyRlB6aC1EVTg1VGZNcTlJMERHSTA5c0duOGF4U0E4MmVON1Uwdk1lR1VBMU8wZTVPcng5N2lWWU5ZRkg1Z25PLXRRNlI1SEVWX0pJMF9FNzN5UW0tTzFJTVMyX0tteWdrMVROTTFQZENWNHpfNzlOUFRRZ1hUSnk4OFMxb1l3bEQ1VW9iRzRtQzhCLXY0UV9LZ2g1V0o1bTF6VmxUWnZaYTR2ejhoRzJQamZQMjZTLU9FQUxFQVVVOHhOWElXSDFhRVVyMnk0RDdXblB5WEo5eWpxdEtYZElHVVVSLXhkMTJXb0pyUDc5RC1B"
-// ✅ Lấy danh sách GamePass của 1 user (userId)
-app.get("/getGamePasses/:userId", async (req, res) => {
-  const userId = req.params.userId;
-  const limit = 100;
-  let cursor = "";
-  let allPasses = [];
+// Create a stockfish instance factory
+function createEngine() {
+  const engine = Stockfish();
+  return engine;
+}
 
+// helper: run Stockfish to get bestmove for a given FEN and movetime (ms)
+function getBestMove(fen, movetimeMs = 500) {
+  return new Promise((resolve, reject) => {
+    const engine = createEngine();
+    let bestMove = null;
+    let ready = false;
+
+    function send(cmd) {
+      try { engine.postMessage(cmd); } catch (e) { /* some builds use engine(cmd) */ try { engine(cmd); } catch (ee) {} }
+    }
+
+    // onmessage for worker-like interface
+    engine.onmessage = function (line) {
+      if (!line) return;
+
+      // some builds provide lines as objects, ensure string
+      const text = typeof line === "string" ? line : (line.data || "");
+
+      // listen for bestmove
+      if (text.startsWith("bestmove")) {
+        const parts = text.split(" ");
+        bestMove = parts[1];
+        // stop engine (some builds require final commands)
+        try { send("quit"); } catch (e) {}
+        return resolve(bestMove);
+      }
+
+      // optional: handle 'uciok' or 'readyok'
+      // console.log("SF:", text);
+    };
+
+    // initialize and send commands
+    // Some builds expect 'uci' 'isready' etc.
+    try {
+      send("uci");
+      send("isready");
+      send("ucinewgame");
+      send(`position fen ${fen}`);
+      // start search
+      send(`go movetime ${Math.max(1, Math.floor(movetimeMs))}`);
+      // if engine never returns, timeout fallback
+      setTimeout(() => {
+        if (!bestMove) {
+          try { send("quit"); } catch (e) {}
+          return reject(new Error("Stockfish timeout/no bestmove returned"));
+        }
+      }, movetimeMs + 2000);
+    } catch (err) {
+      return reject(err);
+    }
+  });
+}
+
+// POST /move
+// body: { startFEN: string (optional, default "startpos"), moves: "e2e4 e7e5 ...", movetime: ms (optional) }
+app.post("/move", async (req, res) => {
   try {
-    while (true) {
-      const url = `https://apis.roblox.com/game-passes/v1/users/${userId}/game-passes?count=${limit}${
-        cursor ? `&exclusiveStartId=${cursor}` : ""
-      }`;
+    const body = req.body || {};
+    const startFEN = (body.startFEN && body.startFEN !== "startpos") ? body.startFEN : null;
+    const movesStr = (body.moves || "").trim(); // space-separated moves in UCI or algebraic SAN? we'll prefer UCI like e2e4
+    const movetime = Number(body.movetime) || 500; // ms for SF
 
-      const response = await fetch(url, {
-        headers: {
-          "x-api-key": API_KEY,
-        },
-      });
+    // create chess instance starting from startFEN or default
+    const chess = startFEN ? new Chess(startFEN) : new Chess();
 
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("Roblox API failed:", response.status, text);
-      return res.status(500).json({ error: "Roblox API error", status: response.status, details: text });
+    // apply moves if provided
+    if (movesStr.length > 0) {
+      const moveList = movesStr.split(/\s+/);
+      for (const mv of moveList) {
+        // Try to play as UCI/long algebraic first (ex: e2e4). chess.js accepts SAN or { from, to, promotion }
+        let played = null;
+        // if mv length 4 or 5 => likely UCI (e2e4 or e7e8q)
+        if (/^[a-h][1-8][a-h][1-8][qrbn]?$/i.test(mv)) {
+          const from = mv.substring(0,2);
+          const to = mv.substring(2,4);
+          const prom = mv.length === 5 ? mv[4] : undefined;
+          try {
+            played = chess.move({ from: from, to: to, promotion: prom });
+          } catch (e) {
+            // ignore
+          }
+        }
+        // fallback: try SAN (algebraic)
+        if (!played) {
+          try { played = chess.move(mv); } catch (e) { played = null; }
+        }
+        if (!played) {
+          return res.status(400).json({ error: "Invalid move in moves list", invalidMove: mv });
+        }
+      }
     }
 
-      const data = await response.json();
-      allPasses.push(...(data.data || []));
+    // now current fen
+    const currentFen = chess.fen();
 
-      if (!data.nextPageExclusiveStartId) break;
-      cursor = data.nextPageExclusiveStartId;
+    // If game over (checkmate/stalemate), return game-over
+    if (chess.game_over()) {
+      return res.json({ bestmove: null, fen: currentFen, gameOver: true, reason: chess.in_checkmate() ? "checkmate" : "draw" });
     }
 
-    const filtered = allPasses.map((p) => ({
-      id: p.id,
-      name: p.name,
-      price: p.price || 0,
-    }));
+    // ask stockfish for bestmove from currentFen
+    const best = await getBestMove(currentFen, movetime);
 
-    res.json({ success: true, passes: filtered });
+    if (!best || best === "(none)") {
+      return res.status(500).json({ error: "No best move returned by engine" });
+    }
+
+    // apply best move to chess to produce next fen
+    // best is UCI like e7e5 or e7e8q
+    let applied = null;
+    if (/^[a-h][1-8][a-h][1-8][qrbn]?$/i.test(best)) {
+      const from = best.substring(0,2);
+      const to = best.substring(2,4);
+      const prom = best.length === 5 ? best[4] : undefined;
+      applied = chess.move({ from: from, to: to, promotion: prom });
+    } else {
+      // fallback SAN
+      applied = chess.move(best);
+    }
+
+    if (!applied) {
+      // If engine returned a move that couldn't be applied, return error
+      return res.status(500).json({ error: "Engine returned move that cannot be applied", engineMove: best });
+    }
+
+    const newFen = chess.fen();
+    return res.json({ bestmove: best, fen: newFen });
+
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ error: "Internal error", details: String(err) });
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.get("/", (req, res) => {
+  res.json({ ok: true, info: "Chess bot API running" });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server started on port ${PORT}`);
+});
